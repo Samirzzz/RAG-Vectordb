@@ -1,0 +1,203 @@
+# rec_server.py  – FastAPI + Pinecone recommender (SDK v3)
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, validator
+from typing import Dict, Any, List, Optional
+from contextlib import asynccontextmanager
+from datetime import datetime
+import logging, sys, time, math
+
+import torch
+from transformers import AutoTokenizer, AutoModel
+from pinecone import Pinecone, ServerlessSpec          # ← v3 import
+
+PINECONE_API_KEY = "api-key"
+INDEX_NAME       = "recommendationn-index"
+
+# ---------- logging ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
+
+# ---------- FastAPI ----------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("🔧  Starting Property-Search API")
+    yield
+    logger.info("🛑  Stopping Property-Search API")
+
+app = FastAPI(lifespan=lifespan, title="Property Recommender")
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
+
+# ---------- Pinecone (SDK v3) ----------
+pc = Pinecone(api_key=PINECONE_API_KEY)
+if INDEX_NAME not in pc.list_indexes():
+    try:
+        pc.create_index(
+            name=INDEX_NAME,
+            dimension=768,
+            metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+        )
+    except Exception as e:
+        logger.warning(f"Could not create index: {e}")
+
+while not pc.describe_index(INDEX_NAME).status["ready"]:
+    logger.info("⌛ Waiting for index to be ready…")
+    time.sleep(1)
+
+index = pc.Index(INDEX_NAME)
+logger.info(f"✅ Connected to Pinecone index '{INDEX_NAME}'")
+
+# ---------- Embeddings ----------
+tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+embed_model = AutoModel.from_pretrained("distilbert-base-uncased")
+
+def embed(text: str) -> List[float]:
+    inputs = tokenizer(text, return_tensors="pt", truncation=True,
+                       padding=True, max_length=512)
+    with torch.no_grad():
+        out = embed_model(**inputs)
+        return out.last_hidden_state.mean(dim=1).squeeze().tolist()
+
+# ---------- Data models ----------
+class PropertySearch(BaseModel):
+    min_price: float | None = 0
+    max_price: float | None = math.inf
+    min_area:  float | None = 0
+    max_area:  float | None = math.inf
+    type: str | None = None
+    unit_type: str | None = None
+    bedrooms: int | None = None
+    bathrooms: int | None = None
+    payment_option: str | None = None
+    city: str | None = None
+    features: List[str] = []
+    min_installment_years: float | None = None
+    max_installment_years: float | None = None
+    min_delivery_in: float | None = None
+    max_delivery_in: float | None = None
+    min_down_payment: float | None = None
+    max_down_payment: float | None = None
+
+    @validator('min_price', 'max_price', 'min_area', 'max_area',
+               'min_installment_years', 'max_installment_years',
+               'min_delivery_in', 'max_delivery_in',
+               'min_down_payment', 'max_down_payment')
+    def non_negative(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("Negative values are not allowed")
+        return v
+
+    @validator('type', 'unit_type', 'payment_option', 'city')
+    def strip_lower(cls, v): return v.lower().strip() if v else v
+
+    @validator('bedrooms', 'bathrooms')
+    def positive_int(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("Room counts must be positive")
+        return v
+
+    @validator('features')
+    def cap_features(cls, v): return [f.strip().capitalize() for f in v]
+
+def filters_to_ps(f: Dict[str, Any]) -> PropertySearch:
+    return PropertySearch(
+        min_price=f.get("price", {}).get("$gte"),
+        max_price=f.get("price", {}).get("$lte", math.inf),
+        min_area =f.get("area",  {}).get("$gte"),
+        max_area =f.get("area",  {}).get("$lte", math.inf),
+        type     =f.get("type", {}).get("$eq"),
+        unit_type=f.get("unit_type", {}).get("$eq"),
+        city     =f.get("city", {}).get("$eq"),
+        payment_option=f.get("payment_option", {}).get("$eq"),
+        bedrooms =f.get("bedrooms", {}).get("$eq"),
+        bathrooms=f.get("bathrooms", {}).get("$eq"),
+        min_down_payment=f.get("down_payment", {}).get("$gte"),
+        max_down_payment=f.get("down_payment", {}).get("$lte"),
+        features=f.get("amenities", {}).get("$in", []),
+    )
+
+# ---------- Search core ----------
+def vector_search(query: str, ps: PropertySearch, top_k: int = 5):
+    emb = embed(query)
+    filt: Dict[str, Any] = {}
+
+    # ranges
+    if ps.min_price: filt["price"] = {"$gte": ps.min_price}
+    if ps.max_price < math.inf: filt.setdefault("price", {})["$lte"] = ps.max_price
+    if ps.min_area:  filt["area"]  = {"$gte": ps.min_area}
+    if ps.max_area < math.inf: filt.setdefault("area", {})["$lte"] = ps.max_area
+
+    # equality
+    if ps.type:          filt["type"]          = ps.type
+    if ps.unit_type:     filt["unit_type"]     = ps.unit_type
+    if ps.payment_option:filt["payment_option"]= ps.payment_option
+    if ps.city:          filt["city"]          = ps.city
+
+    # ±1 bedrooms / bath
+    if ps.bedrooms:
+        filt["bedrooms"] = {"$gte": max(1, ps.bedrooms-1), "$lte": ps.bedrooms+1}
+    if ps.bathrooms:
+        filt["bathrooms"] = {"$gte": max(1, ps.bathrooms-1), "$lte": ps.bathrooms+1}
+
+    # more ranges
+    if ps.min_installment_years:
+        filt.setdefault("installment_years", {})["$gte"] = ps.min_installment_years
+    if ps.max_installment_years:
+        filt.setdefault("installment_years", {})["$lte"] = ps.max_installment_years
+    if ps.min_delivery_in:
+        filt.setdefault("delivery_in", {})["$gte"] = ps.min_delivery_in
+    if ps.max_delivery_in:
+        filt.setdefault("delivery_in", {})["$lte"] = ps.max_delivery_in
+    if ps.min_down_payment:
+        filt.setdefault("down_payment", {})["$gte"] = ps.min_down_payment
+    if ps.max_down_payment:
+        filt.setdefault("down_payment", {})["$lte"] = ps.max_down_payment
+
+    # amenities – at least one
+    if ps.features:
+        filt["amenities"] = {"$in": ps.features}
+
+    def _run(fl: Dict[str, Any]):
+        return index.query(vector=emb, top_k=top_k, filter=fl,
+                           include_metadata=True, include_values=False)
+
+    res = _run(filt)
+    if not res.matches and "type" in filt:
+        fl = filt.copy(); fl.pop("type"); res = _run(fl)
+    if not res.matches and "city" in fl:
+        fl.pop("city", None); res = _run(fl)
+    if not res.matches and "price" in fl:
+        res = _run({"price": fl["price"]})
+    if not res.matches:   res = _run({})
+
+    return [{**(m.metadata or {}), "id": m.id, "similarity_score": m.score}
+            for m in res.matches]
+
+# ---------- API ----------
+class SearchRequest(BaseModel):
+    query: str
+    filters: Dict[str, Any] = {}
+    top_k: int = 5
+
+@app.post("/search")
+def search(req: SearchRequest):
+    try:
+        ps = filters_to_ps(req.filters)
+        return {"matches": vector_search(req.query, ps, req.top_k)}
+    except Exception as exc:
+        logger.error(exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+@app.get("/")
+def root():
+    return {"message": "🏡  Pinecone property recommender running"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("rec_server:app", host="0.0.0.0", port=8002, reload=True)
